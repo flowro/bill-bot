@@ -530,7 +530,7 @@ bot.command('help', async (ctx) => {
 /job <name> - View expenses for a specific job
 /tag last <job> - Tag most recent receipt to job
 /summary - This month's spending
-/export - Download CSV of receipts
+/export - Download CSV (month/year/job/pdf)
 
 **Job Tagging:**
 • Send photo + caption: "Johnson bathroom"
@@ -888,6 +888,99 @@ bot.command('tag', async (ctx) => {
   }
 });
 
+// PDF Generation Function
+async function generatePDF(receipts, periodName, userData) {
+  const PDFDocument = require('pdfkit');
+  const doc = new PDFDocument({ margin: 50 });
+  
+  // Buffer to store PDF data
+  const buffers = [];
+  doc.on('data', buffers.push.bind(buffers));
+  
+  // Header
+  doc.fontSize(20).text('Receipt Report', 50, 50);
+  doc.fontSize(14).text(`Period: ${periodName}`, 50, 80);
+  doc.fontSize(12).text(`User: ${userData.first_name || 'Unknown'}`, 50, 100);
+  doc.fontSize(10).text(`Generated: ${new Date().toLocaleString()}`, 50, 115);
+  
+  // Summary
+  const totalAmount = receipts.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+  const categoryStats = receipts.reduce((acc, r) => {
+    const cat = r.category || 'other';
+    acc[cat] = (acc[cat] || 0) + (parseFloat(r.amount) || 0);
+    return acc;
+  }, {});
+  
+  doc.fontSize(14).text('Summary', 50, 150);
+  doc.fontSize(11)
+     .text(`Total Receipts: ${receipts.length}`, 50, 170)
+     .text(`Total Amount: £${totalAmount.toFixed(2)}`, 50, 185);
+  
+  let yPos = 210;
+  doc.fontSize(10).text('By Category:', 50, yPos);
+  yPos += 15;
+  
+  Object.entries(categoryStats)
+    .sort(([,a], [,b]) => b - a)
+    .forEach(([category, amount]) => {
+      doc.text(`• ${category}: £${amount.toFixed(2)}`, 60, yPos);
+      yPos += 12;
+    });
+  
+  yPos += 20;
+  
+  // Receipt Details
+  doc.fontSize(14).text('Receipt Details', 50, yPos);
+  yPos += 20;
+  
+  // Table headers
+  doc.fontSize(9)
+     .text('Date', 50, yPos)
+     .text('Vendor', 110, yPos)
+     .text('Amount', 200, yPos)
+     .text('Category', 250, yPos)
+     .text('Job', 320, yPos)
+     .text('Description', 380, yPos);
+  
+  yPos += 15;
+  doc.moveTo(50, yPos).lineTo(550, yPos).stroke();
+  yPos += 10;
+  
+  // Receipt rows
+  receipts.forEach(receipt => {
+    if (yPos > 700) {
+      doc.addPage();
+      yPos = 50;
+    }
+    
+    const receiptDate = receipt.receipt_date || '';
+    const vendor = (receipt.vendor || '').substring(0, 15);
+    const amount = `£${(parseFloat(receipt.amount) || 0).toFixed(2)}`;
+    const category = (receipt.category || '').substring(0, 12);
+    const job = (receipt.jobs?.name || '').substring(0, 15);
+    const description = (receipt.description || '').substring(0, 30);
+    
+    doc.fontSize(8)
+       .text(receiptDate, 50, yPos)
+       .text(vendor, 110, yPos)
+       .text(amount, 200, yPos)
+       .text(category, 250, yPos)
+       .text(job, 320, yPos)
+       .text(description, 380, yPos);
+    
+    yPos += 12;
+  });
+  
+  doc.end();
+  
+  return new Promise((resolve) => {
+    doc.on('end', () => {
+      const pdfBuffer = Buffer.concat(buffers);
+      resolve(pdfBuffer);
+    });
+  });
+}
+
 // Export command
 bot.command('export', async (ctx) => {
   try {
@@ -900,8 +993,9 @@ bot.command('export', async (ctx) => {
     
     const args = ctx.message.text.split(' ').slice(1); // Remove '/export'
     
-    let startDate, endDate, periodName;
+    let startDate, endDate, periodName, jobFilter = null, isPDF = false;
     
+    // Parse arguments
     if (args.length === 0) {
       // Default to current month
       const now = new Date();
@@ -909,44 +1003,93 @@ bot.command('export', async (ctx) => {
       endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
       periodName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
     } else {
-      // Parse date argument (e.g., "2026-03" or "monthly")
-      const arg = args[0].toLowerCase();
+      // Check for PDF flag
+      if (args.includes('pdf')) {
+        isPDF = true;
+        args.splice(args.indexOf('pdf'), 1);
+      }
       
-      if (arg === 'monthly' || arg === 'month') {
+      // Check for job filter
+      const jobIndex = args.indexOf('job');
+      if (jobIndex !== -1 && args.length > jobIndex + 1) {
+        jobFilter = args.slice(jobIndex + 1).join(' ');
+        args.splice(jobIndex); // Remove job and name from date parsing
+      }
+      
+      if (args.length === 0 || (args.length === 1 && (args[0] === 'monthly' || args[0] === 'month'))) {
         const now = new Date();
         startDate = new Date(now.getFullYear(), now.getMonth(), 1);
         endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
         periodName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-      } else if (arg.match(/^\d{4}-\d{2}$/)) {
+      } else if (args[0] && args[0].match(/^\d{4}-\d{2}$/)) {
         // YYYY-MM format
-        const [year, month] = arg.split('-').map(Number);
+        const [year, month] = args[0].split('-').map(Number);
         startDate = new Date(year, month - 1, 1);
         endDate = new Date(year, month, 0);
         periodName = startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      } else if (args[0] === 'year') {
+        // Current year
+        const now = new Date();
+        startDate = new Date(now.getFullYear(), 0, 1);
+        endDate = new Date(now.getFullYear(), 11, 31);
+        periodName = now.getFullYear().toString();
       } else {
         await ctx.reply('📝 **Export Usage:**\n\n' +
           '/export - Current month\n' +
           '/export monthly - Current month\n' +
-          '/export 2026-03 - Specific month\n\n' +
-          'Example: /export 2026-03');
+          '/export year - Current year\n' +
+          '/export 2026-03 - Specific month\n' +
+          '/export job Johnson - All receipts for job "Johnson"\n' +
+          '/export pdf month - Current month as PDF\n' +
+          '/export pdf job Johnson - Job receipts as PDF\n\n' +
+          'Examples:\n' +
+          '/export 2026-03\n' +
+          '/export job Johnson bathroom\n' +
+          '/export pdf year');
         return;
       }
     }
     
     // Send processing message
-    const processingMsg = await ctx.reply('📄 Generating CSV export...');
+    const processingMsg = await ctx.reply(`📄 Generating ${isPDF ? 'PDF' : 'CSV'} export...`);
     
-    // Get receipts for the period
-    const { data: receipts, error } = await supabase
+    // Build query for receipts
+    let query = supabase
       .from('receipts')
       .select(`
         *,
         jobs(name, client)
       `)
-      .eq('user_id', userData.user_id)
-      .gte('receipt_date', startDate.toISOString().split('T')[0])
-      .lte('receipt_date', endDate.toISOString().split('T')[0])
-      .order('receipt_date', { ascending: false });
+      .eq('user_id', userData.user_id);
+    
+    if (jobFilter) {
+      // Filter by job name (case-insensitive partial match)
+      const { data: userJobs } = await supabase
+        .from('jobs')
+        .select('id, name')
+        .eq('user_id', userData.user_id)
+        .ilike('name', `%${jobFilter}%`);
+      
+      if (!userJobs || userJobs.length === 0) {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          processingMsg.message_id,
+          `❌ No jobs found matching "${jobFilter}".\n\nUse /jobs to see your jobs.`
+        );
+        return;
+      }
+      
+      const jobIds = userJobs.map(j => j.id);
+      query = query.in('job_id', jobIds);
+      periodName = `Job: ${userJobs.map(j => j.name).join(', ')}`;
+    } else {
+      // Apply date filters for non-job exports
+      query = query
+        .gte('receipt_date', startDate.toISOString().split('T')[0])
+        .lte('receipt_date', endDate.toISOString().split('T')[0]);
+    }
+    
+    const { data: receipts, error } = await query.order('receipt_date', { ascending: false });
       
     if (error) {
       console.error('Error fetching receipts for export:', error);
@@ -964,6 +1107,31 @@ bot.command('export', async (ctx) => {
         processingMsg.message_id,
         `📂 No receipts found for ${periodName}.\n\n📸 Send me some receipts first!`
       );
+      return;
+    }
+    
+    if (isPDF) {
+      // Generate PDF
+      const pdfBuffer = await generatePDF(receipts, periodName, userData);
+      const filename = `receipts_${periodName.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now()}.pdf`;
+      
+      // Calculate summary for caption
+      const totalAmount = receipts.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+      const summaryMsg = `📈 **${periodName} - PDF Report**\n\n📄 **${receipts.length} receipts** | 💰 **Total: £${totalAmount.toFixed(2)}**`;
+      
+      await ctx.replyWithDocument(
+        {
+          source: pdfBuffer,
+          filename: filename
+        },
+        {
+          caption: summaryMsg,
+          parse_mode: 'Markdown'
+        }
+      );
+      
+      // Delete processing message
+      await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
       return;
     }
     
@@ -1189,7 +1357,7 @@ bot.command('summary', async (ctx) => {
     
     // Add tips
     message += `\n💡 **Tips:**\n`;
-    message += `• Use \`/export\` to download CSV\n`;
+    message += `• Use \`/export\` to download CSV/PDF\n`;
     message += `• Use \`/summary week\` for weekly view\n`;
     message += `• Tag receipts to jobs for better tracking`;
     
