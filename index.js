@@ -795,6 +795,170 @@ bot.command('tag', async (ctx) => {
   }
 });
 
+// Export command
+bot.command('export', async (ctx) => {
+  try {
+    const userData = await getOrCreateUser(ctx.from);
+    
+    if (!userData.onboarding_completed) {
+      await ctx.reply('🧾 Please complete setup with /start first.');
+      return;
+    }
+    
+    const args = ctx.message.text.split(' ').slice(1); // Remove '/export'
+    
+    let startDate, endDate, periodName;
+    
+    if (args.length === 0) {
+      // Default to current month
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      periodName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    } else {
+      // Parse date argument (e.g., "2026-03" or "monthly")
+      const arg = args[0].toLowerCase();
+      
+      if (arg === 'monthly' || arg === 'month') {
+        const now = new Date();
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+        periodName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      } else if (arg.match(/^\d{4}-\d{2}$/)) {
+        // YYYY-MM format
+        const [year, month] = arg.split('-').map(Number);
+        startDate = new Date(year, month - 1, 1);
+        endDate = new Date(year, month, 0);
+        periodName = startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      } else {
+        await ctx.reply('📝 **Export Usage:**\n\n' +
+          '/export - Current month\n' +
+          '/export monthly - Current month\n' +
+          '/export 2026-03 - Specific month\n\n' +
+          'Example: /export 2026-03');
+        return;
+      }
+    }
+    
+    // Send processing message
+    const processingMsg = await ctx.reply('📄 Generating CSV export...');
+    
+    // Get receipts for the period
+    const { data: receipts, error } = await supabase
+      .from('receipts')
+      .select(`
+        *,
+        jobs(name, client)
+      `)
+      .eq('user_id', userData.user_id)
+      .gte('receipt_date', startDate.toISOString().split('T')[0])
+      .lte('receipt_date', endDate.toISOString().split('T')[0])
+      .order('receipt_date', { ascending: false });
+      
+    if (error) {
+      console.error('Error fetching receipts for export:', error);
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        '❌ Sorry, there was an error generating your export.'
+      );
+      return;
+    }
+    
+    if (!receipts || receipts.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        processingMsg.message_id,
+        `📂 No receipts found for ${periodName}.\n\n📸 Send me some receipts first!`
+      );
+      return;
+    }
+    
+    // Generate CSV content
+    const csvHeaders = [
+      'Date',
+      'Vendor',
+      'Amount',
+      'Category', 
+      'Description',
+      'Job',
+      'Client',
+      'Receipt URL'
+    ];
+    
+    const csvRows = receipts.map(receipt => [
+      receipt.receipt_date || '',
+      (receipt.vendor || '').replace(/,/g, ';'), // Escape commas
+      receipt.amount || '',
+      receipt.category || '',
+      (receipt.description || '').replace(/,/g, ';'), // Escape commas
+      receipt.jobs?.name || '',
+      receipt.jobs?.client || '',
+      receipt.image_url || ''
+    ]);
+    
+    const csvContent = [csvHeaders, ...csvRows]
+      .map(row => row.map(field => `"${field}"`).join(','))
+      .join('\n');
+    
+    // Create filename
+    const filename = `receipts_${periodName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.csv`;
+    
+    // Calculate totals for summary
+    const totalAmount = receipts.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+    
+    // Category breakdown
+    const byCategory = receipts.reduce((acc, r) => {
+      const cat = r.category || 'other';
+      acc[cat] = (acc[cat] || 0) + (parseFloat(r.amount) || 0);
+      return acc;
+    }, {});
+    
+    let summaryMsg = `📊 **Export Complete - ${periodName}**\n\n`;
+    summaryMsg += `📄 **${receipts.length} receipts** | 💰 **Total: £${totalAmount.toFixed(2)}**\n\n`;
+    
+    if (Object.keys(byCategory).length > 0) {
+      summaryMsg += '**By Category:**\n';
+      Object.entries(byCategory)
+        .sort(([,a], [,b]) => b - a)
+        .forEach(([category, amount]) => {
+          const emoji = {
+            materials: '🔧',
+            fuel: '⛽', 
+            tools: '🔨',
+            food: '🍴',
+            labor: '👷',
+            vehicle: '🚗',
+            office: '💼',
+            other: '📝'
+          }[category] || '📝';
+          summaryMsg += `${emoji} ${category}: £${amount.toFixed(2)}\n`;
+        });
+    }
+    
+    // Send the CSV file
+    await ctx.replyWithDocument(
+      {
+        source: Buffer.from(csvContent, 'utf8'),
+        filename: filename
+      },
+      {
+        caption: summaryMsg,
+        parse_mode: 'Markdown'
+      }
+    );
+    
+    // Delete the processing message
+    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id);
+    
+    console.log(`Export generated for user ${ctx.from.id}: ${receipts.length} receipts, ${periodName}`);
+    
+  } catch (error) {
+    console.error('Error in export command:', error);
+    await ctx.reply('❌ Sorry, there was an error generating your export. Please try again.');
+  }
+});
+
 // Summary command
 bot.command('summary', async (ctx) => {
   try {
