@@ -10,6 +10,7 @@ const fs = require('fs');
 const https = require('https');
 const path = require('path');
 const cron = require('node-cron');
+const QRCode = require('qrcode');
 
 // Environment variables
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -93,12 +94,13 @@ async function uploadToSupabase(localPath, fileName, userId) {
 }
 
 // Helper function to get or create user (returns enhanced data for onboarding)
-async function getOrCreateUser(telegramUser) {
+async function getOrCreateUser(telegramUser, referralCode = null) {
   try {
     const { data, error } = await supabase.rpc('get_or_create_user', {
       p_telegram_id: telegramUser.id,
       p_telegram_username: telegramUser.username || null,
-      p_first_name: telegramUser.first_name || null
+      p_first_name: telegramUser.first_name || null,
+      p_referral_code: referralCode
     });
     
     if (error) {
@@ -433,10 +435,51 @@ async function parseManualExpense(text, userId) {
 
 // Command handlers
 
-// Start command
+// QR Code generation for referral links
+async function generateReferralQR(referralCode) {
+  try {
+    const botUsername = await bot.api.getMe().then(me => me.username);
+    const telegramDeepLink = `https://t.me/${botUsername}?start=ref_${referralCode}`;
+    
+    // Generate QR code as base64 data URL
+    const qrCodeDataURL = await QRCode.toDataURL(telegramDeepLink, {
+      errorCorrectionLevel: 'M',
+      type: 'image/png',
+      quality: 0.92,
+      margin: 1,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF'
+      },
+      width: 256
+    });
+    
+    return {
+      qrCodeDataURL,
+      deepLink: telegramDeepLink,
+      referralCode
+    };
+  } catch (error) {
+    console.error('Error generating QR code:', error);
+    throw error;
+  }
+}
+
+
+
+// Start command with referral tracking
 bot.command('start', async (ctx) => {
   try {
-    const userData = await getOrCreateUser(ctx.from);
+    // Check for referral parameter
+    const startPayload = ctx.match;
+    let referralCode = null;
+    
+    if (startPayload && startPayload.startsWith('ref_')) {
+      referralCode = startPayload.replace('ref_', '');
+      console.log(`New user ${ctx.from.first_name} (${ctx.from.id}) from referral: ${referralCode}`);
+    }
+    
+    const userData = await getOrCreateUser(ctx.from, referralCode);
     
     // Check if user needs onboarding
     if (!userData.onboarding_completed) {
@@ -481,6 +524,7 @@ bot.command('help', async (ctx) => {
 **Commands:**
 /start - Welcome message
 /help - Show this help
+/qr - Generate QR code for sharing
 /jobs - List your active jobs
 /newjob <name> - Create a new job/client
 /job <name> - View expenses for a specific job
@@ -501,6 +545,55 @@ bot.command('help', async (ctx) => {
 Need help? Just ask me in plain English!`;
 
   await ctx.reply(helpMessage, { parse_mode: 'Markdown' });
+});
+
+// QR code generation for sharing/onboarding
+bot.command('qr', async (ctx) => {
+  try {
+    const userData = await getOrCreateUser(ctx.from);
+    
+    if (!userData.onboarding_completed) {
+      await ctx.reply('🧾 Please complete setup with /start first.');
+      return;
+    }
+    
+    // Generate a unique referral code for this user
+    const { data: referralData, error: refError } = await supabase.rpc('generate_referral_code', {
+      p_prefix: ctx.from.first_name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'user'
+    });
+    
+    if (refError) {
+      console.error('Error generating referral code:', refError);
+      await ctx.reply('❌ Error generating QR code. Please try again.');
+      return;
+    }
+    
+    const referralCode = referralData;
+    
+    // Generate QR code
+    const qrData = await generateReferralQR(referralCode);
+    
+    // Convert base64 data URL to buffer
+    const base64Data = qrData.qrCodeDataURL.replace(/^data:image\/png;base64,/, '');
+    const qrBuffer = Buffer.from(base64Data, 'base64');
+    
+    await ctx.replyWithPhoto({
+      source: qrBuffer,
+      filename: 'billbot-qr.png'
+    }, {
+      caption: `🧾 **Share Bill Bot**\n\n` +
+        `📱 Scan this QR code to get started with Bill Bot\n\n` +
+        `🔗 Or share this link: ${qrData.deepLink}\n\n` +
+        `Perfect for sharing with other tradespeople!`,
+      parse_mode: 'Markdown'
+    });
+    
+    console.log(`Generated QR code for user ${ctx.from.id} with referral code: ${referralCode}`);
+    
+  } catch (error) {
+    console.error('Error in QR command:', error);
+    await ctx.reply('❌ Error generating QR code. Please try again later.');
+  }
 });
 
 // Jobs command
