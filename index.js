@@ -475,6 +475,8 @@ bot.command('help', async (ctx) => {
 /help - Show this help
 /jobs - List your active jobs
 /newjob <name> - Create a new job/client
+/job <name> - View expenses for a specific job
+/tag last <job> - Tag most recent receipt to job
 /summary - This month's spending
 /export - Download CSV of receipts
 
@@ -586,6 +588,202 @@ bot.command('newjob', async (ctx) => {
   } catch (error) {
     console.error('Error in newjob command:', error);
     await ctx.reply('❌ Sorry, there was an error creating your job. Please try again.');
+  }
+});
+
+// Job details command
+bot.command('job', async (ctx) => {
+  try {
+    const jobName = ctx.message.text.replace('/job', '').trim();
+    
+    if (!jobName) {
+      await ctx.reply('💼 Please specify a job name. Example: /job Johnson bathroom');
+      return;
+    }
+    
+    const userId = await getOrCreateUser(ctx.from);
+    
+    // Find the job
+    const { data: job, error: jobError } = await supabase
+      .from('jobs')
+      .select('id, name, client, created_at')
+      .eq('user_id', userId.user_id)
+      .ilike('name', `%${jobName}%`)
+      .limit(1)
+      .single();
+      
+    if (jobError || !job) {
+      await ctx.reply(`❌ Job "${jobName}" not found. Use /jobs to see all your jobs.`);
+      return;
+    }
+    
+    // Get all receipts for this job
+    const { data: receipts, error: receiptsError } = await supabase
+      .from('receipts')
+      .select('amount, vendor, receipt_date, category, description, created_at')
+      .eq('job_id', job.id)
+      .order('receipt_date', { ascending: false });
+      
+    if (receiptsError) {
+      console.error('Error fetching receipts for job:', receiptsError);
+      await ctx.reply('❌ Sorry, there was an error fetching job details.');
+      return;
+    }
+    
+    let message = `📄 **${job.name}**\n`;
+    if (job.client) {
+      message += `👤 Client: ${job.client}\n`;
+    }
+    message += `📅 Created: ${new Date(job.created_at).toLocaleDateString()}\n\n`;
+    
+    if (!receipts || receipts.length === 0) {
+      message += '📂 No expenses yet for this job.\n\n';
+      message += '💡 Tag receipts to this job by:\n';
+      message += '• Sending photos with caption "' + job.name + '"\n';
+      message += '• Using manual entry: "' + job.name + ' job: 50 materials"\n';
+      message += '• Replying to receipt confirmations with job name';
+    } else {
+      const total = receipts.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
+      
+      message += `💰 **Total: £${total.toFixed(2)}**\n`;
+      message += `📂 **${receipts.length} expenses**\n\n`;
+      
+      // Group by category
+      const byCategory = receipts.reduce((acc, r) => {
+        const cat = r.category || 'other';
+        if (!acc[cat]) {
+          acc[cat] = { count: 0, total: 0 };
+        }
+        acc[cat].count++;
+        acc[cat].total += parseFloat(r.amount) || 0;
+        return acc;
+      }, {});
+      
+      message += '**By Category:**\n';
+      for (const [category, stats] of Object.entries(byCategory)) {
+        const emoji = {
+          materials: '🔧',
+          fuel: '⛽',
+          tools: '🔨',
+          food: '🍴',
+          labor: '👷',
+          vehicle: '🚗',
+          office: '💼',
+          other: '📝'
+        }[category] || '📝';
+        
+        message += `${emoji} ${category}: £${stats.total.toFixed(2)} (${stats.count} items)\n`;
+      }
+      
+      message += '\n**Recent Expenses:**\n';
+      const recentExpenses = receipts.slice(0, 5);
+      for (const receipt of recentExpenses) {
+        const date = new Date(receipt.receipt_date).toLocaleDateString();
+        const amount = receipt.amount ? `£${parseFloat(receipt.amount).toFixed(2)}` : 'N/A';
+        message += `• ${date} - ${receipt.vendor || 'Unknown'} - ${amount}\n`;
+      }
+      
+      if (receipts.length > 5) {
+        message += `\n🔽 ${receipts.length - 5} more expenses...`;
+      }
+    }
+    
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+    
+  } catch (error) {
+    console.error('Error in job command:', error);
+    await ctx.reply('❌ Sorry, there was an error fetching job details.');
+  }
+});
+
+// Tag command for retroactive tagging
+bot.command('tag', async (ctx) => {
+  try {
+    const args = ctx.message.text.split(' ').slice(1); // Remove '/tag'
+    
+    if (args.length < 2) {
+      await ctx.reply('🏷️ **Tag Usage:**\n\n' +
+        '/tag last JobName - Tag the most recent receipt\n' +
+        '/tag 3 JobName - Tag the 3rd most recent receipt\n\n' +
+        'Example: /tag last Johnson bathroom');
+      return;
+    }
+    
+    const position = args[0].toLowerCase();
+    const jobName = args.slice(1).join(' ');
+    
+    const userId = await getOrCreateUser(ctx.from);
+    
+    // Parse position
+    let receiptIndex = 0;
+    if (position === 'last') {
+      receiptIndex = 0;
+    } else if (position.match(/^\d+$/)) {
+      receiptIndex = parseInt(position) - 1;
+      if (receiptIndex < 0) {
+        await ctx.reply('❌ Position must be 1 or higher (1 = most recent)');
+        return;
+      }
+    } else {
+      await ctx.reply('❌ Invalid position. Use "last" or a number (e.g. "3")');
+      return;
+    }
+    
+    // Find or create the job
+    const job = await findOrCreateJob(userId.user_id, jobName);
+    
+    // Get user's receipts (untagged ones first, then all)
+    const { data: receipts, error: receiptsError } = await supabase
+      .from('receipts')
+      .select('id, amount, vendor, receipt_date, category, job_id')
+      .eq('user_id', userId.user_id)
+      .order('created_at', { ascending: false });
+      
+    if (receiptsError) {
+      console.error('Error fetching receipts:', receiptsError);
+      await ctx.reply('❌ Sorry, there was an error fetching your receipts.');
+      return;
+    }
+    
+    if (!receipts || receipts.length === 0) {
+      await ctx.reply('❌ No receipts found. Send me a photo or manual entry first!');
+      return;
+    }
+    
+    if (receiptIndex >= receipts.length) {
+      await ctx.reply(`❌ You only have ${receipts.length} receipts. Try a smaller number.`);
+      return;
+    }
+    
+    const targetReceipt = receipts[receiptIndex];
+    
+    // Tag the receipt
+    const { error: updateError } = await supabase
+      .from('receipts')
+      .update({ job_id: job.id })
+      .eq('id', targetReceipt.id);
+      
+    if (updateError) {
+      console.error('Error tagging receipt:', updateError);
+      await ctx.reply('❌ Sorry, there was an error tagging the receipt.');
+      return;
+    }
+    
+    const receiptDesc = `£${parseFloat(targetReceipt.amount || 0).toFixed(2)} from ${targetReceipt.vendor || 'Unknown'} (${targetReceipt.category || 'other'})`;
+    
+    await ctx.reply(
+      `✅ **Receipt tagged!**\n\n` +
+      `📄 Receipt: ${receiptDesc}\n` +
+      `🏷️ Job: **${job.name}**\n\n` +
+      `💡 Use /job ${job.name} to see all expenses for this job.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+    console.log(`Tagged receipt ${targetReceipt.id} to job ${job.name}`);
+    
+  } catch (error) {
+    console.error('Error in tag command:', error);
+    await ctx.reply('❌ Sorry, there was an error tagging the receipt.');
   }
 });
 
