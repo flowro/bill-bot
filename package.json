@@ -1,0 +1,23 @@
+{
+  "name": "bill-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for receipt tracking and expense management for tradespeople",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["telegram", "bot", "receipts", "expenses", "trades"],
+  "author": "THE GRAPHS",
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.35.3",
+    "@supabase/supabase-js": "^2.101.1",
+    "@anthropic-ai/sdk": "^0.34.0",
+    "dotenv": "^17.3.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
