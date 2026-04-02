@@ -8,14 +8,21 @@
     "dev": "node --watch index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["telegram", "bot", "receipts", "expenses", "trades"],
+  "keywords": [
+    "telegram",
+    "bot",
+    "receipts",
+    "expenses",
+    "trades"
+  ],
   "author": "THE GRAPHS",
   "license": "MIT",
   "dependencies": {
-    "grammy": "^1.35.3",
-    "@supabase/supabase-js": "^2.101.1",
     "@anthropic-ai/sdk": "^0.33.0",
-    "dotenv": "^17.3.1"
+    "@supabase/supabase-js": "^2.101.1",
+    "dotenv": "^17.3.1",
+    "grammy": "^1.35.3",
+    "node-cron": "^3.0.3"
   },
   "engines": {
     "node": ">=18"

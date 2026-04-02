@@ -8,6 +8,7 @@ const { processReceipt, formatReceiptData, estimateProcessingCost } = require('.
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
+const cron = require('node-cron');
 
 // Environment variables
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -353,6 +354,157 @@ bot.command('newjob', async (ctx) => {
   } catch (error) {
     console.error('Error in newjob command:', error);
     await ctx.reply('❌ Sorry, there was an error creating your job. Please try again.');
+  }
+});
+
+// Summary command
+bot.command('summary', async (ctx) => {
+  try {
+    const userId = await getOrCreateUser(ctx.from);
+    const args = ctx.message.text.split(' ').slice(1); // Remove '/summary'
+    
+    let startDate, endDate, periodName;
+    
+    if (args.length === 0) {
+      // Default to current month
+      const now = new Date();
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      periodName = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    } else if (args[0] === 'week') {
+      // Current week (Monday to Sunday)
+      const now = new Date();
+      const monday = new Date(now.setDate(now.getDate() - now.getDay() + 1));
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      startDate = monday;
+      endDate = sunday;
+      periodName = 'This Week';
+    } else if (args[0] === 'lastweek') {
+      // Last week
+      const now = new Date();
+      const monday = new Date(now.setDate(now.getDate() - now.getDay() + 1 - 7));
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      startDate = monday;
+      endDate = sunday;
+      periodName = 'Last Week';
+    } else if (args[0] === 'lastmonth') {
+      // Last month
+      const now = new Date();
+      const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+      startDate = lastMonth;
+      endDate = lastMonthEnd;
+      periodName = lastMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    } else {
+      // Try to parse as YYYY-MM format
+      const [year, month] = args[0].split('-');
+      if (year && month) {
+        const yearNum = parseInt(year);
+        const monthNum = parseInt(month) - 1; // JS months are 0-indexed
+        startDate = new Date(yearNum, monthNum, 1);
+        endDate = new Date(yearNum, monthNum + 1, 0);
+        periodName = startDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      } else {
+        await ctx.reply(
+          '❌ Invalid format. Examples:\n' +
+          '/summary - This month\n' +
+          '/summary week - This week\n' +
+          '/summary lastweek - Last week\n' +
+          '/summary lastmonth - Last month\n' +
+          '/summary 2026-03 - March 2026'
+        );
+        return;
+      }
+    }
+    
+    // Format dates for SQL
+    const startDateStr = startDate.toISOString().split('T')[0];
+    const endDateStr = endDate.toISOString().split('T')[0];
+    
+    // Get spending summary using the SQL function
+    const { data: summary, error } = await supabase.rpc('get_spending_summary', {
+      p_telegram_id: ctx.from.id,
+      p_start_date: startDateStr,
+      p_end_date: endDateStr
+    });
+    
+    if (error) {
+      console.error('Error getting spending summary:', error);
+      throw error;
+    }
+    
+    if (!summary || summary.length === 0) {
+      await ctx.reply(`📊 **${periodName} Summary**\n\nNo receipts found for this period.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    
+    const summaryData = summary[0];
+    const totalAmount = parseFloat(summaryData.total_amount) || 0;
+    const categoryBreakdown = summaryData.category_breakdown || {};
+    const jobBreakdown = summaryData.job_breakdown || {};
+    const receiptCount = summaryData.receipt_count || 0;
+    
+    let message = `📊 **${periodName} Summary**\n\n`;
+    message += `💰 **Total Spent:** £${totalAmount.toFixed(2)}\n`;
+    message += `📄 **Receipts:** ${receiptCount}\n\n`;
+    
+    // Category breakdown
+    if (Object.keys(categoryBreakdown).length > 0) {
+      message += `📂 **By Category:**\n`;
+      const categories = Object.entries(categoryBreakdown)
+        .sort(([,a], [,b]) => parseFloat(b) - parseFloat(a))
+        .slice(0, 8); // Top 8 categories
+      
+      for (const [category, amount] of categories) {
+        const categoryEmoji = {
+          materials: '🔧',
+          fuel: '⛽',
+          tools: '🔨',
+          food: '🍔',
+          labor: '👷',
+          vehicle: '🚗',
+          office: '📋',
+          other: '📦'
+        }[category] || '📦';
+        
+        const percentage = totalAmount > 0 ? ((parseFloat(amount) / totalAmount) * 100).toFixed(0) : 0;
+        message += `  ${categoryEmoji} ${category}: £${parseFloat(amount).toFixed(2)} (${percentage}%)\n`;
+      }
+      message += '\n';
+    }
+    
+    // Job breakdown
+    if (Object.keys(jobBreakdown).length > 0) {
+      message += `💼 **By Job:**\n`;
+      const jobs = Object.entries(jobBreakdown)
+        .sort(([,a], [,b]) => parseFloat(b) - parseFloat(a))
+        .slice(0, 5); // Top 5 jobs
+      
+      for (const [jobName, amount] of jobs) {
+        const percentage = totalAmount > 0 ? ((parseFloat(amount) / totalAmount) * 100).toFixed(0) : 0;
+        message += `  🏷️ ${jobName}: £${parseFloat(amount).toFixed(2)} (${percentage}%)\n`;
+      }
+      
+      if (Object.keys(jobBreakdown).length > 5) {
+        message += `  ... and ${Object.keys(jobBreakdown).length - 5} more jobs\n`;
+      }
+    }
+    
+    // Add tips
+    message += `\n💡 **Tips:**\n`;
+    message += `• Use \`/export\` to download CSV\n`;
+    message += `• Use \`/summary week\` for weekly view\n`;
+    message += `• Tag receipts to jobs for better tracking`;
+    
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+    
+    console.log(`Summary generated for user ${ctx.from.id}: ${periodName}`);
+    
+  } catch (error) {
+    console.error('Error in summary command:', error);
+    await ctx.reply('❌ Sorry, there was an error generating your summary. Please try again.');
   }
 });
 
@@ -771,6 +923,9 @@ async function startBot() {
     await bot.start();
     console.log('🤖 Bill Bot is running!');
     
+    // Setup automated summaries
+    setupCronJobs();
+    
   } catch (error) {
     console.error('Failed to start bot:', error);
     process.exit(1);
@@ -789,6 +944,217 @@ process.on('SIGINT', async () => {
   await bot.stop();
   process.exit(0);
 });
+
+// Automated summary functions
+async function sendWeeklySummary() {
+  try {
+    console.log('Sending weekly summaries...');
+    
+    // Get all users who have receipts in the last 30 days
+    const { data: activeUsers, error } = await supabase
+      .rpc('get_active_users_last_30_days');
+    
+    if (error) {
+      console.error('Error fetching active users:', error);
+      return;
+    }
+    
+    if (!activeUsers || activeUsers.length === 0) {
+      console.log('No active users found for weekly summary');
+      return;
+    }
+    
+    for (const user of activeUsers) {
+      try {
+        // Calculate last week dates
+        const now = new Date();
+        const lastSunday = new Date(now.setDate(now.getDate() - now.getDay()));
+        const lastMonday = new Date(lastSunday);
+        lastMonday.setDate(lastSunday.getDate() - 6);
+        
+        const startDateStr = lastMonday.toISOString().split('T')[0];
+        const endDateStr = lastSunday.toISOString().split('T')[0];
+        
+        // Get summary
+        const { data: summary, error: summaryError } = await supabase.rpc('get_spending_summary', {
+          p_telegram_id: user.telegram_id,
+          p_start_date: startDateStr,
+          p_end_date: endDateStr
+        });
+        
+        if (summaryError || !summary || summary.length === 0) {
+          console.log(`No data for user ${user.telegram_id}`);
+          continue;
+        }
+        
+        const summaryData = summary[0];
+        const totalAmount = parseFloat(summaryData.total_amount) || 0;
+        const receiptCount = summaryData.receipt_count || 0;
+        
+        if (totalAmount === 0) {
+          console.log(`No spending for user ${user.telegram_id}`);
+          continue;
+        }
+        
+        // Format message
+        let message = `📅 **Weekly Summary** (${lastMonday.toLocaleDateString()} - ${lastSunday.toLocaleDateString()})\n\n`;
+        message += `💰 **Total Spent:** £${totalAmount.toFixed(2)}\n`;
+        message += `📄 **Receipts:** ${receiptCount}\n\n`;
+        
+        // Add top categories
+        const categoryBreakdown = summaryData.category_breakdown || {};
+        if (Object.keys(categoryBreakdown).length > 0) {
+          message += `🏆 **Top Categories:**\n`;
+          const topCategories = Object.entries(categoryBreakdown)
+            .sort(([,a], [,b]) => parseFloat(b) - parseFloat(a))
+            .slice(0, 3);
+          
+          for (const [category, amount] of topCategories) {
+            message += `  • ${category}: £${parseFloat(amount).toFixed(2)}\n`;
+          }
+        }
+        
+        message += `\n💡 Use /summary for detailed breakdown`;
+        
+        // Send message
+        await bot.api.sendMessage(user.telegram_id, message, { parse_mode: 'Markdown' });
+        console.log(`Weekly summary sent to user ${user.telegram_id}`);
+        
+        // Add small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (userError) {
+        console.error(`Error sending weekly summary to user ${user.telegram_id}:`, userError);
+      }
+    }
+    
+  } catch (error) {
+    console.error('Error in sendWeeklySummary:', error);
+  }
+}
+
+async function sendMonthlySummary() {
+  try {
+    console.log('Sending monthly summaries...');
+    
+    // Similar to weekly but for last month
+    const { data: activeUsers, error } = await supabase
+      .rpc('get_active_users_last_30_days');
+    
+    if (error) {
+      console.error('Error fetching active users:', error);
+      return;
+    }
+    
+    if (!activeUsers || activeUsers.length === 0) {
+      console.log('No active users found for monthly summary');
+      return;
+    }
+    
+    for (const user of activeUsers) {
+      try {
+        // Calculate last month dates
+        const now = new Date();
+        const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+        
+        const startDateStr = lastMonth.toISOString().split('T')[0];
+        const endDateStr = lastMonthEnd.toISOString().split('T')[0];
+        
+        // Get summary
+        const { data: summary, error: summaryError } = await supabase.rpc('get_spending_summary', {
+          p_telegram_id: user.telegram_id,
+          p_start_date: startDateStr,
+          p_end_date: endDateStr
+        });
+        
+        if (summaryError || !summary || summary.length === 0) {
+          console.log(`No monthly data for user ${user.telegram_id}`);
+          continue;
+        }
+        
+        const summaryData = summary[0];
+        const totalAmount = parseFloat(summaryData.total_amount) || 0;
+        const receiptCount = summaryData.receipt_count || 0;
+        
+        if (totalAmount === 0) {
+          console.log(`No monthly spending for user ${user.telegram_id}`);
+          continue;
+        }
+        
+        // Format message
+        const monthName = lastMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+        let message = `📆 **Monthly Summary - ${monthName}**\n\n`;
+        message += `💰 **Total Spent:** £${totalAmount.toFixed(2)}\n`;
+        message += `📄 **Receipts:** ${receiptCount}\n\n`;
+        
+        // Add category and job breakdown
+        const categoryBreakdown = summaryData.category_breakdown || {};
+        const jobBreakdown = summaryData.job_breakdown || {};
+        
+        if (Object.keys(categoryBreakdown).length > 0) {
+          message += `🏆 **Top Categories:**\n`;
+          const topCategories = Object.entries(categoryBreakdown)
+            .sort(([,a], [,b]) => parseFloat(b) - parseFloat(a))
+            .slice(0, 3);
+          
+          for (const [category, amount] of topCategories) {
+            message += `  • ${category}: £${parseFloat(amount).toFixed(2)}\n`;
+          }
+          message += '\n';
+        }
+        
+        if (Object.keys(jobBreakdown).length > 0) {
+          message += `💼 **Top Jobs:**\n`;
+          const topJobs = Object.entries(jobBreakdown)
+            .sort(([,a], [,b]) => parseFloat(b) - parseFloat(a))
+            .slice(0, 3);
+          
+          for (const [jobName, amount] of topJobs) {
+            message += `  • ${jobName}: £${parseFloat(amount).toFixed(2)}\n`;
+          }
+          message += '\n';
+        }
+        
+        message += `📊 Use /summary lastmonth for full details`;
+        
+        // Send message
+        await bot.api.sendMessage(user.telegram_id, message, { parse_mode: 'Markdown' });
+        console.log(`Monthly summary sent to user ${user.telegram_id}`);
+        
+        // Add small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (userError) {
+        console.error(`Error sending monthly summary to user ${user.telegram_id}:`, userError);
+      }
+    }
+    
+  } catch (error) {
+    console.error('Error in sendMonthlySummary:', error);
+  }
+}
+
+// Setup cron jobs
+function setupCronJobs() {
+  // Weekly summary every Sunday at 7 PM
+  cron.schedule('0 19 * * 0', () => {
+    console.log('Running weekly summary cron job...');
+    sendWeeklySummary();
+  }, {
+    timezone: "Europe/London"
+  });
+  
+  // Monthly summary on 1st of month at 9 AM
+  cron.schedule('0 9 1 * *', () => {
+    console.log('Running monthly summary cron job...');
+    sendMonthlySummary();
+  }, {
+    timezone: "Europe/London"
+  });
+  
+  console.log('✅ Cron jobs scheduled: Weekly (Sun 7PM), Monthly (1st 9AM)');
+}
 
 // Start the application
 if (require.main === module) {
