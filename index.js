@@ -4,6 +4,7 @@
 require('dotenv').config();
 const { Bot, GrammyError, HttpError } = require('grammy');
 const { createClient } = require('@supabase/supabase-js');
+const { processReceipt, formatReceiptData, estimateProcessingCost } = require('./claude-vision');
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
@@ -12,9 +13,11 @@ const path = require('path');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-if (!BOT_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!BOT_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !ANTHROPIC_API_KEY) {
   console.error('Missing required environment variables');
+  console.error('Required: TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY');
   process.exit(1);
 }
 
@@ -165,13 +168,61 @@ Need help? Just ask me in plain English!`;
   await ctx.reply(helpMessage, { parse_mode: 'Markdown' });
 });
 
+// Recent receipts command
+bot.command('recent', async (ctx) => {
+  try {
+    const userId = await getOrCreateUser(ctx.from);
+    
+    const { data: receipts, error } = await supabase
+      .from('receipts')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(5);
+    
+    if (error) {
+      console.error('Error fetching recent receipts:', error);
+      throw error;
+    }
+    
+    if (!receipts || receipts.length === 0) {
+      await ctx.reply('📄 No receipts found. Send me a photo of a receipt to get started!');
+      return;
+    }
+    
+    let message = '📄 **Recent Receipts**\n\n';
+    
+    receipts.forEach((receipt, index) => {
+      const amount = receipt.amount ? `£${receipt.amount}` : 'Unknown';
+      const date = receipt.receipt_date || 'Unknown date';
+      const vendor = receipt.vendor || 'Unknown vendor';
+      const category = receipt.category || 'other';
+      
+      message += `${index + 1}. **${vendor}** - ${amount}\n`;
+      message += `   📅 ${date} • 📂 ${category}\n`;
+      if (receipt.description && receipt.description !== 'Receipt processed') {
+        message += `   📝 ${receipt.description}\n`;
+      }
+      message += '\n';
+    });
+    
+    message += '💡 Use /summary for totals by category (coming soon)';
+    
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+    
+  } catch (error) {
+    console.error('Error in recent command:', error);
+    await ctx.reply('❌ Sorry, there was an error fetching your recent receipts.');
+  }
+});
+
 // Photo message handler
 bot.on('message:photo', async (ctx) => {
   try {
     console.log(`Received photo from ${ctx.from.first_name} (${ctx.from.id})`);
     
     // Send initial processing message
-    const processingMsg = await ctx.reply('📸 Processing your receipt...');
+    const processingMsg = await ctx.reply('📸 Processing your receipt with AI...');
     
     // Get user ID
     const userId = await getOrCreateUser(ctx.from);
@@ -184,18 +235,34 @@ bot.on('message:photo', async (ctx) => {
     const localPath = await downloadFile(photo.file_id, fileName);
     console.log(`Downloaded photo to: ${localPath}`);
     
+    // Update processing message for OCR step
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      processingMsg.message_id,
+      '🤖 Analyzing receipt with Claude Vision...'
+    );
+    
+    // Process with Claude Vision
+    const extractedData = await processReceipt(localPath);
+    console.log('Extracted data:', extractedData);
+    
     // Upload to Supabase
     const imageUrl = await uploadToSupabase(localPath, fileName, userId);
     console.log(`Uploaded to Supabase: ${imageUrl}`);
     
-    // Store receipt record (basic for now, OCR will be added in next issue)
+    // Store receipt record with extracted data
     const { data: receiptData, error: receiptError } = await supabase
       .from('receipts')
       .insert({
         user_id: userId,
         image_url: imageUrl,
         telegram_message_id: ctx.message.message_id,
-        description: ctx.message.caption || null
+        amount: extractedData.amount,
+        vendor: extractedData.vendor,
+        receipt_date: extractedData.date,
+        category: extractedData.category,
+        description: extractedData.description,
+        raw_ocr_text: extractedData.raw_ocr_text
       })
       .select()
       .single();
@@ -205,24 +272,45 @@ bot.on('message:photo', async (ctx) => {
       throw receiptError;
     }
     
-    // Update processing message
+    // Format and send results
+    const resultMessage = formatReceiptData(extractedData);
+    
+    // Update processing message with results
     await ctx.api.editMessageText(
       ctx.chat.id,
       processingMsg.message_id,
-      `✅ Receipt saved!
-
-📁 **Receipt ID:** ${receiptData.id.slice(0, 8)}...
-📅 **Date:** ${new Date().toLocaleDateString()}
-💬 **Description:** ${ctx.message.caption || 'None'}
-
-💡 **Next:** I'll add OCR processing soon to extract amount, vendor, and category automatically!`
+      resultMessage,
+      { parse_mode: 'Markdown' }
     );
     
-    console.log(`Receipt saved for user ${ctx.from.id}: ${receiptData.id}`);
+    console.log(`Receipt processed and saved for user ${ctx.from.id}: ${receiptData.id}`);
+    
+    // Send cost estimate if low confidence
+    if (extractedData.confidence < 0.7) {
+      await ctx.reply(
+        '💡 **Need better results?** \n\n' +
+        'For better OCR accuracy:\n' +
+        '• Ensure good lighting\n' +
+        '• Keep receipt flat and straight\n' +
+        '• Avoid shadows or glare\n' +
+        '• Take photo directly above receipt',
+        { parse_mode: 'Markdown' }
+      );
+    }
     
   } catch (error) {
     console.error('Error processing photo:', error);
-    await ctx.reply('❌ Sorry, there was an error processing your receipt. Please try again.');
+    
+    // Update or send error message
+    try {
+      const errorMsg = '❌ Sorry, there was an error processing your receipt. The photo has been saved but OCR failed. You can manually add details or try uploading again with better lighting.';
+      
+      if (ctx.message.photo) {
+        await ctx.reply(errorMsg);
+      }
+    } catch (replyError) {
+      console.error('Error sending error message:', replyError);
+    }
   }
 });
 
