@@ -1336,25 +1336,40 @@ bot.on('message:text', async (ctx) => {
       }
     }
     
-    // Simple responses for common queries
-    const text = ctx.message.text.toLowerCase();
-    
-    if (text.includes('help') || text.includes('how')) {
-      await ctx.reply('👋 I can help you track expenses! Send me a photo of a receipt and I\'ll process it. Use /help to see all commands.');
-    } else if (text.includes('summary') || text.includes('spending') || text.includes('total')) {
-      await ctx.reply('📊 Spending summaries coming soon! Use /summary command when it\'s ready.');
-    } else if (text.includes('job') || text.includes('project') || text.includes('client')) {
-      await ctx.reply('💼 Job tracking works! Use /jobs to see jobs or /newjob <name> to create one.');
-    } else {
-      // Generic helpful response
-      await ctx.reply(`💬 I received your message: "${ctx.message.text}"
-
-I'm still learning! Right now I can:
-📸 Process receipt photos
-🏷️ Tag receipts to jobs
-💬 Answer basic questions
-
-More AI features coming soon! Use /help to see what I can do.`);
+    // Try to process as natural language query about spending
+    try {
+      const queryResult = await processNaturalLanguageQuery(ctx.message.text, userId.user_id);
+      
+      if (queryResult.error) {
+        console.log('NLP Query error:', queryResult.error);
+        // Fall back to simple responses
+        const text = ctx.message.text.toLowerCase();
+        
+        if (text.includes('help') || text.includes('how')) {
+          await ctx.reply('👋 I can help you track expenses! Send me a photo of a receipt and I\'ll process it. Use /help to see all commands.');
+        } else if (text.includes('summary') || text.includes('spending') || text.includes('total')) {
+          await ctx.reply('📊 Try asking: "How much did I spend this month?" or "What are my expenses?"');
+        } else if (text.includes('job') || text.includes('project') || text.includes('client')) {
+          await ctx.reply('💼 Try asking: "Show me expenses for [job name]" or use /job <name>');
+        } else {
+          await ctx.reply(`💬 I received your message: "${ctx.message.text}"\n\nI can answer questions about your spending! Try asking:\n• "How much did I spend this month?"\n• "Show materials expenses"\n• "What did I spend on Johnson job?"\n\nOr use /help for commands.`);
+        }
+        return;
+      }
+      
+      if (queryResult.answer && queryResult.answer.trim()) {
+        // Successfully processed as spending query
+        await ctx.reply(queryResult.answer, { parse_mode: 'Markdown' });
+        console.log(`Processed NLP query: "${ctx.message.text}" -> ${queryResult.data?.length || 0} results`);
+      } else {
+        // No relevant data found
+        await ctx.reply('💬 I understood your question, but couldn\'t find any relevant expenses.\n\n📸 Send me some receipts first, or use /help for available commands.');
+      }
+      
+    } catch (nlpError) {
+      console.error('NLP processing error:', nlpError);
+      // Fall back to simple response
+      await ctx.reply(`💬 I received your message: "${ctx.message.text}"\n\nI can answer questions about your spending! Try asking:\n• "How much did I spend this month?"\n• "Show materials expenses"\n• "What did I spend on Johnson job?"\n\nOr use /help for commands.`);
     }
     
   } catch (error) {
