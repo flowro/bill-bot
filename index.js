@@ -5,6 +5,7 @@ require('dotenv').config();
 const { Bot, GrammyError, HttpError } = require('grammy');
 const { createClient } = require('@supabase/supabase-js');
 const { processReceipt, formatReceiptData, estimateProcessingCost } = require('./claude-vision');
+const { processNaturalLanguageQuery } = require('./nlp-queries');
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
@@ -91,7 +92,7 @@ async function uploadToSupabase(localPath, fileName, userId) {
   }
 }
 
-// Helper function to get or create user
+// Helper function to get or create user (returns enhanced data for onboarding)
 async function getOrCreateUser(telegramUser) {
   try {
     const { data, error } = await supabase.rpc('get_or_create_user', {
@@ -105,10 +106,151 @@ async function getOrCreateUser(telegramUser) {
       throw error;
     }
     
-    return data;
+    return data[0]; // Return first row of the result
   } catch (error) {
     console.error('Error in getOrCreateUser:', error);
     throw error;
+  }
+}
+
+// Helper function to get user ID (for backward compatibility)
+async function getUserId(telegramUser) {
+  const userData = await getOrCreateUser(telegramUser);
+  return userData.user_id;
+}
+
+// Helper function to update onboarding step
+async function updateOnboardingStep(telegramId, step, data = {}) {
+  try {
+    const { data: result, error } = await supabase.rpc('update_onboarding_step', {
+      p_telegram_id: telegramId,
+      p_step: step,
+      p_display_name: data.displayName || null,
+      p_currency: data.currency || null,
+      p_trade: data.trade || null,
+      p_trade_other: data.tradeOther || null
+    });
+    
+    if (error) {
+      console.error('Error updating onboarding step:', error);
+      throw error;
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('Error in updateOnboardingStep:', error);
+    throw error;
+  }
+}
+
+// Onboarding flow handler
+async function handleOnboarding(ctx, userData) {
+  const step = userData.onboarding_step;
+  
+  switch (step) {
+    case 0:
+      // Welcome and ask for name
+      await updateOnboardingStep(ctx.from.id, 1);
+      await ctx.reply(
+        `🎉 **Welcome to Bill Bot!**\n\n` +
+        `I help tradespeople track expenses by processing receipt photos with AI.\n\n` +
+        `Let's get you set up. First, what should I call you?\n\n` +
+        `💬 Just reply with your preferred name (e.g., "Mike" or "Mike Smith")`,
+        { parse_mode: 'Markdown' }
+      );
+      break;
+      
+    case 1:
+      // Store name and ask for currency
+      const displayName = ctx.message.text.trim();
+      await updateOnboardingStep(ctx.from.id, 2, { displayName });
+      
+      const currencyKeyboard = {
+        inline_keyboard: [
+          [
+            { text: '🇬🇧 GBP (£)', callback_data: 'onboard_currency_GBP' },
+            { text: '🇺🇸 USD ($)', callback_data: 'onboard_currency_USD' }
+          ],
+          [
+            { text: '🇪🇺 EUR (€)', callback_data: 'onboard_currency_EUR' }
+          ]
+        ]
+      };
+      
+      await ctx.reply(
+        `Nice to meet you, **${displayName}**! 👋\n\n` +
+        `Which currency do you use for expenses?`,
+        { parse_mode: 'Markdown', reply_markup: currencyKeyboard }
+      );
+      break;
+      
+    case 2:
+      // This step is handled by callback query (currency selection)
+      break;
+      
+    case 3:
+      // Ask for trade
+      const tradeKeyboard = {
+        inline_keyboard: [
+          [
+            { text: '🔧 Plumber', callback_data: 'onboard_trade_plumber' },
+            { text: '🏗️ Builder', callback_data: 'onboard_trade_builder' }
+          ],
+          [
+            { text: '⚡ Electrician', callback_data: 'onboard_trade_electrician' },
+            { text: '🌿 Landscaper', callback_data: 'onboard_trade_landscaper' }
+          ],
+          [
+            { text: '🔨 Other Trade', callback_data: 'onboard_trade_other' }
+          ]
+        ]
+      };
+      
+      await ctx.reply(
+        `💼 What's your trade or profession?\n\n` +
+        `This helps me categorize your expenses better.`,
+        { reply_markup: tradeKeyboard }
+      );
+      break;
+      
+    case 4:
+      // Tutorial
+      await updateOnboardingStep(ctx.from.id, 5);
+      
+      await ctx.reply(
+        `🎓 **Quick Tutorial**\n\n` +
+        `📸 **Send me a photo** of any receipt and I'll:\n` +
+        `• Extract the amount, vendor, and date\n` +
+        `• Categorize the expense\n` +
+        `• Store it in your expense tracker\n\n` +
+        `🏷️ **Tag to jobs** by:\n` +
+        `• Adding a caption: "Johnson bathroom"\n` +
+        `• Using the quick-tag buttons\n` +
+        `• Replying to receipts with job names\n\n` +
+        `📊 **Get summaries** with:\n` +
+        `• /summary - This month's breakdown\n` +
+        `• /jobs - View your active jobs\n` +
+        `• Automatic weekly/monthly reports\n\n` +
+        `**Ready to try? Send me a photo of a receipt! 📸**`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      // Also send a helpful tip
+      await ctx.reply(
+        `💡 **Pro Tips:**\n\n` +
+        `• Take photos in good lighting\n` +
+        `• Keep receipts flat and straight\n` +
+        `• Use /help anytime for commands\n\n` +
+        `Your expenses are tracked automatically! 🚀`,
+        { parse_mode: 'Markdown' }
+      );
+      
+      console.log(`User ${ctx.from.id} completed onboarding`);
+      break;
+      
+    default:
+      console.log(`Unknown onboarding step: ${step}`);
+      break;
   }
 }
 
@@ -197,6 +339,96 @@ async function tagReceiptToJob(receiptId, jobId) {
     console.error('Error in tagReceiptToJob:', error);
     throw error;
   }
+}
+
+// Helper function to parse manual expense entry
+async function parseManualExpense(text, userId) {
+  // Examples: "45 screwfix materials", "32.50 fuel", "Johnson job: 120 materials"
+  const patterns = [
+    // Pattern 1: "JobName job: amount category [description]"
+    /^(.+?)\s+job:\s*(\d+(?:\.\d{1,2})?)\s+([a-z]+)(?:\s+(.+))?$/i,
+    // Pattern 2: "amount vendor category [description]"
+    /^(\d+(?:\.\d{1,2})?)\s+([a-zA-Z]+[\w\s]*)\s+([a-z]+)(?:\s+(.+))?$/i,
+    // Pattern 3: "amount category [description]"
+    /^(\d+(?:\.\d{1,2})?)\s+([a-z]+)(?:\s+(.+))?$/i
+  ];
+
+  const validCategories = ['materials', 'fuel', 'tools', 'food', 'labor', 'vehicle', 'office', 'other'];
+  
+  // Try pattern 1: Job-specific entry
+  let match = text.match(patterns[0]);
+  if (match) {
+    const jobName = match[1].trim();
+    const amount = parseFloat(match[2]);
+    const category = match[3].toLowerCase();
+    const description = match[4] || `${category} expense`;
+    
+    if (!validCategories.includes(category)) {
+      return { error: `Invalid category: ${category}. Valid: ${validCategories.join(', ')}` };
+    }
+    
+    try {
+      const job = await findOrCreateJob(userId, jobName);
+      return {
+        amount,
+        category,
+        description,
+        vendor: 'Manual entry',
+        jobId: job.id,
+        jobName: job.name,
+        confidence: 1.0
+      };
+    } catch (error) {
+      return { error: 'Failed to create/find job' };
+    }
+  }
+  
+  // Try pattern 2: Amount + vendor + category
+  match = text.match(patterns[1]);
+  if (match) {
+    const amount = parseFloat(match[1]);
+    const vendor = match[2].trim();
+    const category = match[3].toLowerCase();
+    const description = match[4] || `${vendor} ${category}`;
+    
+    if (!validCategories.includes(category)) {
+      return { error: `Invalid category: ${category}. Valid: ${validCategories.join(', ')}` };
+    }
+    
+    return {
+      amount,
+      category,
+      description,
+      vendor,
+      jobId: null,
+      jobName: null,
+      confidence: 1.0
+    };
+  }
+  
+  // Try pattern 3: Amount + category only
+  match = text.match(patterns[2]);
+  if (match) {
+    const amount = parseFloat(match[1]);
+    const category = match[2].toLowerCase();
+    const description = match[3] || `${category} expense`;
+    
+    if (!validCategories.includes(category)) {
+      return { error: `Invalid category: ${category}. Valid: ${validCategories.join(', ')}` };
+    }
+    
+    return {
+      amount,
+      category,
+      description,
+      vendor: 'Manual entry',
+      jobId: null,
+      jobName: null,
+      confidence: 1.0
+    };
+  }
+  
+  return { error: null }; // No match, not a manual expense entry
 }
 
 // Command handlers
@@ -841,6 +1073,68 @@ bot.on('message:text', async (ctx) => {
           await ctx.reply('❌ Sorry, there was an error creating the job. Please try again.');
           return;
         }
+      }
+    }
+    
+    // Try to parse as manual expense entry
+    const expenseData = await parseManualExpense(ctx.message.text, userId.user_id);
+    
+    if (expenseData.error) {
+      await ctx.reply(`❌ ${expenseData.error}\n\n💡 Try formats like:\n• "45.50 materials"\n• "32 fuel from Shell"\n• "Johnson job: 120 materials"`);
+      return;
+    }
+    
+    if (expenseData.amount) {
+      try {
+        // Save manual expense entry to database
+        const receiptData = {
+          user_id: userId.user_id,
+          job_id: expenseData.jobId,
+          amount: expenseData.amount,
+          vendor: expenseData.vendor,
+          receipt_date: new Date().toISOString().split('T')[0],
+          category: expenseData.category,
+          description: expenseData.description,
+          raw_ocr_text: `Manual entry: ${ctx.message.text}`,
+          telegram_message_id: ctx.message.message_id,
+          image_url: null // No image for manual entries
+        };
+        
+        const { data: receipt, error: receiptError } = await supabase
+          .from('receipts')
+          .insert(receiptData)
+          .select()
+          .single();
+          
+        if (receiptError) {
+          console.error('Error saving manual expense:', receiptError);
+          await ctx.reply('❌ Sorry, there was an error saving your expense. Please try again.');
+          return;
+        }
+        
+        // Format confirmation message
+        let confirmMessage = `✅ **Manual expense added**\n\n`;
+        confirmMessage += `💰 **Amount:** £${expenseData.amount.toFixed(2)}\n`;
+        confirmMessage += `🏪 **Vendor:** ${expenseData.vendor}\n`;
+        confirmMessage += `📅 **Date:** ${receiptData.receipt_date}\n`;
+        confirmMessage += `📂 **Category:** ${expenseData.category.charAt(0).toUpperCase() + expenseData.category.slice(1)}\n`;
+        confirmMessage += `📝 **Description:** ${expenseData.description}\n`;
+        
+        if (expenseData.jobName) {
+          confirmMessage += `🏷️ **Job:** ${expenseData.jobName}\n`;
+        } else {
+          confirmMessage += `🏷️ **Job:** None (reply with job name to tag)\n`;
+        }
+        
+        await ctx.reply(confirmMessage, { parse_mode: 'Markdown' });
+        
+        console.log(`Manual expense added: £${expenseData.amount} ${expenseData.category} by ${ctx.from.first_name}`);
+        return;
+        
+      } catch (error) {
+        console.error('Error processing manual expense:', error);
+        await ctx.reply('❌ Sorry, there was an error processing your expense. Please try again.');
+        return;
       }
     }
     
