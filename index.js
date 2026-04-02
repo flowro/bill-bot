@@ -111,6 +111,93 @@ async function getOrCreateUser(telegramUser) {
   }
 }
 
+// Helper function to find or create job
+async function findOrCreateJob(userId, jobName) {
+  try {
+    // First try to find existing job (case-insensitive)
+    const { data: existingJobs, error: findError } = await supabase
+      .from('jobs')
+      .select('id, name')
+      .eq('user_id', userId)
+      .ilike('name', jobName)
+      .limit(1);
+    
+    if (findError) {
+      console.error('Error finding job:', findError);
+      throw findError;
+    }
+    
+    if (existingJobs && existingJobs.length > 0) {
+      return existingJobs[0];
+    }
+    
+    // Create new job if not found
+    const { data: newJob, error: createError } = await supabase
+      .from('jobs')
+      .insert({
+        user_id: userId,
+        name: jobName.trim()
+      })
+      .select()
+      .single();
+    
+    if (createError) {
+      console.error('Error creating job:', createError);
+      throw createError;
+    }
+    
+    return newJob;
+  } catch (error) {
+    console.error('Error in findOrCreateJob:', error);
+    throw error;
+  }
+}
+
+// Helper function to get user's jobs for inline keyboard
+async function getUserJobs(userId, limit = 5) {
+  try {
+    const { data: jobs, error } = await supabase
+      .from('jobs')
+      .select('id, name')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    
+    if (error) {
+      console.error('Error fetching user jobs:', error);
+      throw error;
+    }
+    
+    return jobs || [];
+  } catch (error) {
+    console.error('Error in getUserJobs:', error);
+    return [];
+  }
+}
+
+// Helper function to tag receipt to job
+async function tagReceiptToJob(receiptId, jobId) {
+  try {
+    const { data, error } = await supabase
+      .from('receipts')
+      .update({ job_id: jobId })
+      .eq('id', receiptId)
+      .select()
+      .single();
+    
+    if (error) {
+      console.error('Error tagging receipt to job:', error);
+      throw error;
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Error in tagReceiptToJob:', error);
+    throw error;
+  }
+}
+
 // Command handlers
 
 // Start command
@@ -158,6 +245,11 @@ bot.command('help', async (ctx) => {
 /summary - This month's spending
 /export - Download CSV of receipts
 
+**Job Tagging:**
+• Send photo + caption: "Johnson bathroom"
+• Reply to receipt with job name
+• Use inline keyboard for quick selection
+
 **Examples:**
 "How much did I spend this month?"
 "Show me receipts for the Johnson job"
@@ -166,6 +258,102 @@ bot.command('help', async (ctx) => {
 Need help? Just ask me in plain English!`;
 
   await ctx.reply(helpMessage, { parse_mode: 'Markdown' });
+});
+
+// Jobs command
+bot.command('jobs', async (ctx) => {
+  try {
+    const userId = await getOrCreateUser(ctx.from);
+    
+    const { data: jobs, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
+    if (error) {
+      console.error('Error fetching jobs:', error);
+      throw error;
+    }
+    
+    if (!jobs || jobs.length === 0) {
+      await ctx.reply('💼 No jobs found. Use /newjob <name> to create one!');
+      return;
+    }
+    
+    let message = '💼 **Your Jobs**\n\n';
+    
+    for (const job of jobs) {
+      message += `📋 **${job.name}**\n`;
+      if (job.client) {
+        message += `   👤 Client: ${job.client}\n`;
+      }
+      message += `   📅 Created: ${new Date(job.created_at).toLocaleDateString()}\n`;
+      message += `   📊 Status: ${job.status}\n\n`;
+    }
+    
+    message += '💡 Use /newjob <name> to add a new job';
+    
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+    
+  } catch (error) {
+    console.error('Error in jobs command:', error);
+    await ctx.reply('❌ Sorry, there was an error fetching your jobs.');
+  }
+});
+
+// New job command
+bot.command('newjob', async (ctx) => {
+  try {
+    const jobName = ctx.message.text.replace('/newjob', '').trim();
+    
+    if (!jobName) {
+      await ctx.reply('💼 Please specify a job name. Example: /newjob Johnson bathroom renovation');
+      return;
+    }
+    
+    const userId = await getOrCreateUser(ctx.from);
+    
+    // Check if job already exists
+    const { data: existingJobs, error: checkError } = await supabase
+      .from('jobs')
+      .select('id, name')
+      .eq('user_id', userId)
+      .ilike('name', jobName);
+    
+    if (checkError) {
+      console.error('Error checking existing jobs:', checkError);
+      throw checkError;
+    }
+    
+    if (existingJobs && existingJobs.length > 0) {
+      await ctx.reply(`💼 Job "${jobName}" already exists! Use /jobs to see all your jobs.`);
+      return;
+    }
+    
+    // Create new job
+    const { data: newJob, error: createError } = await supabase
+      .from('jobs')
+      .insert({
+        user_id: userId,
+        name: jobName
+      })
+      .select()
+      .single();
+    
+    if (createError) {
+      console.error('Error creating job:', createError);
+      throw createError;
+    }
+    
+    await ctx.reply(`✅ Created job: **${jobName}**\n\n💡 Next time you send a receipt, you can tag it to this job!`, { parse_mode: 'Markdown' });
+    
+    console.log(`User ${ctx.from.id} created job: ${jobName}`);
+    
+  } catch (error) {
+    console.error('Error in newjob command:', error);
+    await ctx.reply('❌ Sorry, there was an error creating your job. Please try again.');
+  }
 });
 
 // Recent receipts command
@@ -227,6 +415,23 @@ bot.on('message:photo', async (ctx) => {
     // Get user ID
     const userId = await getOrCreateUser(ctx.from);
     
+    // Check if there's a caption for job tagging
+    const caption = ctx.message.caption?.trim();
+    let jobId = null;
+    let jobName = null;
+    
+    if (caption) {
+      try {
+        const job = await findOrCreateJob(userId, caption);
+        jobId = job.id;
+        jobName = job.name;
+        console.log(`Tagged to job: ${jobName} (${jobId})`);
+      } catch (jobError) {
+        console.error('Error handling job from caption:', jobError);
+        // Continue processing without job tagging
+      }
+    }
+    
     // Get the largest photo size
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     const fileName = `receipt_${Date.now()}.jpg`;
@@ -255,6 +460,7 @@ bot.on('message:photo', async (ctx) => {
       .from('receipts')
       .insert({
         user_id: userId,
+        job_id: jobId,
         image_url: imageUrl,
         telegram_message_id: ctx.message.message_id,
         amount: extractedData.amount,
@@ -273,14 +479,52 @@ bot.on('message:photo', async (ctx) => {
     }
     
     // Format and send results
-    const resultMessage = formatReceiptData(extractedData);
+    let resultMessage = formatReceiptData(extractedData);
+    
+    // Add job tag info if tagged
+    if (jobName) {
+      resultMessage += `\n🏷️ Tagged to: **${jobName}**`;
+    } else {
+      resultMessage += `\n🏷️ No job tagged`;
+    }
+    
+    // Get user's recent jobs for inline keyboard
+    const recentJobs = await getUserJobs(userId, 5);
+    
+    // Create inline keyboard for job tagging (if not already tagged)
+    let keyboard = null;
+    if (!jobId && recentJobs.length > 0) {
+      const buttons = recentJobs.map(job => ([
+        {
+          text: job.name,
+          callback_data: `tag_${receiptData.id}_${job.id}`
+        }
+      ]));
+      
+      // Add "New Job" button
+      buttons.push([
+        {
+          text: '➕ New Job',
+          callback_data: `newjob_${receiptData.id}`
+        }
+      ]);
+      
+      keyboard = {
+        inline_keyboard: buttons
+      };
+      
+      resultMessage += `\n\n💡 Quick tag to a job:`;
+    }
     
     // Update processing message with results
     await ctx.api.editMessageText(
       ctx.chat.id,
       processingMsg.message_id,
       resultMessage,
-      { parse_mode: 'Markdown' }
+      { 
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      }
     );
     
     console.log(`Receipt processed and saved for user ${ctx.from.id}: ${receiptData.id}`);
@@ -314,6 +558,67 @@ bot.on('message:photo', async (ctx) => {
   }
 });
 
+// Callback query handler for inline keyboards
+bot.on('callback_query', async (ctx) => {
+  try {
+    const data = ctx.callbackQuery.data;
+    console.log(`Callback query from ${ctx.from.first_name}: ${data}`);
+    
+    if (data.startsWith('tag_')) {
+      // Handle job tagging: tag_receiptId_jobId
+      const [_, receiptId, jobId] = data.split('_');
+      
+      // Get job name for confirmation
+      const { data: job, error: jobError } = await supabase
+        .from('jobs')
+        .select('name')
+        .eq('id', jobId)
+        .single();
+      
+      if (jobError || !job) {
+        await ctx.answerCallbackQuery('Job not found', { show_alert: true });
+        return;
+      }
+      
+      // Tag receipt to job
+      await tagReceiptToJob(receiptId, jobId);
+      
+      // Update the message
+      const updatedMessage = ctx.callbackQuery.message.text.replace(
+        /🏷️ No job tagged/,
+        `🏷️ Tagged to: **${job.name}**`
+      ).replace(/\n\n💡 Quick tag to a job:/, '');
+      
+      await ctx.editMessageText(
+        updatedMessage,
+        { parse_mode: 'Markdown' }
+      );
+      
+      await ctx.answerCallbackQuery(`Tagged to ${job.name}!`);
+      
+    } else if (data.startsWith('newjob_')) {
+      // Handle new job creation: newjob_receiptId
+      const receiptId = data.split('_')[1];
+      
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        `📋 Creating a new job for this receipt.\n\nReply to this message with the job name.\n\nExample: "Johnson bathroom renovation"`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            force_reply: true,
+            input_field_placeholder: "Enter job name..."
+          }
+        }
+      );
+    }
+    
+  } catch (error) {
+    console.error('Error handling callback query:', error);
+    await ctx.answerCallbackQuery('Error occurred', { show_alert: true });
+  }
+});
+
 // Text message handler
 bot.on('message:text', async (ctx) => {
   try {
@@ -327,6 +632,66 @@ bot.on('message:text', async (ctx) => {
     // Get user ID
     const userId = await getOrCreateUser(ctx.from);
     
+    // Check if this is a reply to a receipt (job tagging)
+    if (ctx.message.reply_to_message) {
+      const replyText = ctx.message.reply_to_message.text;
+      
+      // Look for receipt confirmation message pattern
+      if (replyText && (replyText.includes('✅ Got it!') || replyText.includes('📸 Receipt processed') || replyText.includes('🏪'))) {
+        const jobName = ctx.message.text.trim();
+        
+        // Find the most recent receipt for this user that hasn't been tagged
+        const { data: recentReceipt, error: receiptError } = await supabase
+          .from('receipts')
+          .select('id, job_id')
+          .eq('user_id', userId)
+          .is('job_id', null)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+        
+        if (!receiptError && recentReceipt) {
+          try {
+            const job = await findOrCreateJob(userId, jobName);
+            await tagReceiptToJob(recentReceipt.id, job.id);
+            
+            await ctx.reply(
+              `✅ Tagged receipt to: **${job.name}**`,
+              { parse_mode: 'Markdown' }
+            );
+            
+            console.log(`Tagged receipt ${recentReceipt.id} to job ${job.name}`);
+            return;
+          } catch (tagError) {
+            console.error('Error tagging receipt via reply:', tagError);
+            await ctx.reply('❌ Sorry, there was an error tagging the receipt. Please try again.');
+            return;
+          }
+        }
+      }
+      
+      // Handle new job creation reply
+      if (replyText && replyText.includes('Reply to this message with the job name')) {
+        const jobName = ctx.message.text.trim();
+        
+        try {
+          const job = await findOrCreateJob(userId, jobName);
+          
+          await ctx.reply(
+            `✅ Created job: **${job.name}**\n\n💡 Use /jobs to see all your jobs.`,
+            { parse_mode: 'Markdown' }
+          );
+          
+          console.log(`Created new job via reply: ${job.name}`);
+          return;
+        } catch (jobError) {
+          console.error('Error creating job via reply:', jobError);
+          await ctx.reply('❌ Sorry, there was an error creating the job. Please try again.');
+          return;
+        }
+      }
+    }
+    
     // Simple responses for common queries
     const text = ctx.message.text.toLowerCase();
     
@@ -335,13 +700,14 @@ bot.on('message:text', async (ctx) => {
     } else if (text.includes('summary') || text.includes('spending') || text.includes('total')) {
       await ctx.reply('📊 Spending summaries coming soon! Use /summary command when it\'s ready.');
     } else if (text.includes('job') || text.includes('project') || text.includes('client')) {
-      await ctx.reply('💼 Job tracking is being built! Use /jobs command when it\'s ready.');
+      await ctx.reply('💼 Job tracking works! Use /jobs to see jobs or /newjob <name> to create one.');
     } else {
       // Generic helpful response
       await ctx.reply(`💬 I received your message: "${ctx.message.text}"
 
 I'm still learning! Right now I can:
 📸 Process receipt photos
+🏷️ Tag receipts to jobs
 💬 Answer basic questions
 
 More AI features coming soon! Use /help to see what I can do.`);

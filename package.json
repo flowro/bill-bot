@@ -14,7 +14,7 @@
   "dependencies": {
     "grammy": "^1.35.3",
     "@supabase/supabase-js": "^2.101.1",
-    "@anthropic-ai/sdk": "^0.34.0",
+    "@anthropic-ai/sdk": "^0.33.0",
     "dotenv": "^17.3.1"
   },
   "engines": {
