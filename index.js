@@ -436,9 +436,17 @@ async function parseManualExpense(text, userId) {
 // Start command
 bot.command('start', async (ctx) => {
   try {
-    const userId = await getOrCreateUser(ctx.from);
+    const userData = await getOrCreateUser(ctx.from);
     
-    const welcomeMessage = `🧾 Welcome to Bill Bot!
+    // Check if user needs onboarding
+    if (!userData.onboarding_completed) {
+      console.log(`New user ${ctx.from.first_name} (${ctx.from.id}) starting onboarding`);
+      await handleOnboarding(ctx, userData);
+      return;
+    }
+    
+    // Existing user - show welcome message
+    const welcomeMessage = `🧾 Welcome back to Bill Bot!
 
 I help tradespeople track expenses by photographing receipts.
 
@@ -456,7 +464,7 @@ I help tradespeople track expenses by photographing receipts.
 Ready to track your expenses?`;
 
     await ctx.reply(welcomeMessage);
-    console.log(`User ${ctx.from.first_name} (${ctx.from.id}) started the bot`);
+    console.log(`Existing user ${ctx.from.first_name} (${ctx.from.id}) started the bot`);
   } catch (error) {
     console.error('Error in start command:', error);
     await ctx.reply('Sorry, there was an error setting up your account. Please try again.');
@@ -994,8 +1002,14 @@ bot.on('message:photo', async (ctx) => {
     // Send initial processing message
     const processingMsg = await ctx.reply('📸 Processing your receipt with AI...');
     
-    // Get user ID
-    const userId = await getOrCreateUser(ctx.from);
+    // Get user data
+    const userData = await getOrCreateUser(ctx.from);
+    
+    // Handle onboarding if not completed
+    if (!userData.onboarding_completed) {
+      await ctx.reply('🧾 Welcome! Please use /start to set up your account first.');
+      return;
+    }
     
     // Check if there's a caption for job tagging
     const caption = ctx.message.caption?.trim();
@@ -1004,7 +1018,7 @@ bot.on('message:photo', async (ctx) => {
     
     if (caption) {
       try {
-        const job = await findOrCreateJob(userId, caption);
+        const job = await findOrCreateJob(userData.user_id, caption);
         jobId = job.id;
         jobName = job.name;
         console.log(`Tagged to job: ${jobName} (${jobId})`);
@@ -1034,14 +1048,14 @@ bot.on('message:photo', async (ctx) => {
     console.log('Extracted data:', extractedData);
     
     // Upload to Supabase
-    const imageUrl = await uploadToSupabase(localPath, fileName, userId);
+    const imageUrl = await uploadToSupabase(localPath, fileName, userData.user_id);
     console.log(`Uploaded to Supabase: ${imageUrl}`);
     
     // Store receipt record with extracted data
     const { data: receiptData, error: receiptError } = await supabase
       .from('receipts')
       .insert({
-        user_id: userId,
+        user_id: userData.user_id,
         job_id: jobId,
         image_url: imageUrl,
         telegram_message_id: ctx.message.message_id,
@@ -1211,8 +1225,14 @@ bot.on('message:text', async (ctx) => {
       return;
     }
     
-    // Get user ID
-    const userId = await getOrCreateUser(ctx.from);
+    // Get user data
+    const userData = await getOrCreateUser(ctx.from);
+    
+    // Handle onboarding if not completed
+    if (!userData.onboarding_completed) {
+      await handleOnboarding(ctx, userData);
+      return;
+    }
     
     // Check if this is a reply to a receipt (job tagging)
     if (ctx.message.reply_to_message) {
@@ -1226,7 +1246,7 @@ bot.on('message:text', async (ctx) => {
         const { data: recentReceipt, error: receiptError } = await supabase
           .from('receipts')
           .select('id, job_id')
-          .eq('user_id', userId)
+          .eq('user_id', userData.user_id)
           .is('job_id', null)
           .order('created_at', { ascending: false })
           .limit(1)
@@ -1234,7 +1254,7 @@ bot.on('message:text', async (ctx) => {
         
         if (!receiptError && recentReceipt) {
           try {
-            const job = await findOrCreateJob(userId, jobName);
+            const job = await findOrCreateJob(userData.user_id, jobName);
             await tagReceiptToJob(recentReceipt.id, job.id);
             
             await ctx.reply(
@@ -1257,7 +1277,7 @@ bot.on('message:text', async (ctx) => {
         const jobName = ctx.message.text.trim();
         
         try {
-          const job = await findOrCreateJob(userId, jobName);
+          const job = await findOrCreateJob(userData.user_id, jobName);
           
           await ctx.reply(
             `✅ Created job: **${job.name}**\n\n💡 Use /jobs to see all your jobs.`,
@@ -1275,7 +1295,7 @@ bot.on('message:text', async (ctx) => {
     }
     
     // Try to parse as manual expense entry
-    const expenseData = await parseManualExpense(ctx.message.text, userId.user_id);
+    const expenseData = await parseManualExpense(ctx.message.text, userData.user_id);
     
     if (expenseData.error) {
       await ctx.reply(`❌ ${expenseData.error}\n\n💡 Try formats like:\n• "45.50 materials"\n• "32 fuel from Shell"\n• "Johnson job: 120 materials"`);
@@ -1286,7 +1306,7 @@ bot.on('message:text', async (ctx) => {
       try {
         // Save manual expense entry to database
         const receiptData = {
-          user_id: userId.user_id,
+          user_id: userData.user_id,
           job_id: expenseData.jobId,
           amount: expenseData.amount,
           vendor: expenseData.vendor,
@@ -1338,7 +1358,7 @@ bot.on('message:text', async (ctx) => {
     
     // Try to process as natural language query about spending
     try {
-      const queryResult = await processNaturalLanguageQuery(ctx.message.text, userId.user_id);
+      const queryResult = await processNaturalLanguageQuery(ctx.message.text, userData.user_id);
       
       if (queryResult.error) {
         console.log('NLP Query error:', queryResult.error);
