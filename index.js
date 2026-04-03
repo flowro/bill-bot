@@ -531,6 +531,9 @@ bot.command('help', async (ctx) => {
 /tag last <job> - Tag most recent receipt to job
 /summary - This month's spending
 /export - Download CSV (month/year/job/pdf)
+/upgrade - Upgrade to Pro (unlimited receipts)
+/usage - Check monthly usage
+/billing - Manage subscription
 
 **Job Tagging:**
 • Send photo + caption: "Johnson bathroom"
@@ -1419,13 +1422,112 @@ bot.command('recent', async (ctx) => {
   }
 });
 
+// Subscription management commands
+bot.command('upgrade', async (ctx) => {
+  try {
+    const userData = await getOrCreateUser(ctx.from);
+    
+    if (userData.subscription_tier === 'pro' || userData.subscription_tier === 'business') {
+      await ctx.reply(
+        `🌟 You're already on the **${userData.subscription_tier.toUpperCase()}** plan!\n\n` +
+        `Manage your subscription: [Billing Portal](${process.env.BASE_URL || 'http://localhost:3000'}/portal?customer_id=${userData.stripe_customer_id})`,
+        { parse_mode: 'Markdown', disable_web_page_preview: true }
+      );
+      return;
+    }
+    
+    const { data: currentUsage } = await supabase.rpc('get_user_monthly_usage', {
+      user_telegram_id: ctx.from.id
+    });
+    
+    await ctx.reply(
+      `📊 **Current Usage:** ${currentUsage}/20 receipts this month\n\n` +
+      `🚀 **Upgrade to Pro** for unlimited receipts!\n\n` +
+      `✨ **Pro Features:**\n` +
+      `• Unlimited photo processing\n` +
+      `• Job/client tagging\n` +
+      `• CSV exports for accountant\n` +
+      `• Monthly spending reports\n` +
+      `• Priority support\n\n` +
+      `💰 **Just $4.99/month** - Cancel anytime\n\n` +
+      `[Upgrade Now](${process.env.BASE_URL || 'http://localhost:3000'}/checkout?tier=pro&telegram_id=${ctx.from.id})`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    );
+    
+  } catch (error) {
+    console.error('Error in upgrade command:', error);
+    await ctx.reply('❌ Sorry, there was an error. Please try again.');
+  }
+});
+
+bot.command('billing', async (ctx) => {
+  try {
+    const userData = await getOrCreateUser(ctx.from);
+    
+    if (!userData.stripe_customer_id) {
+      await ctx.reply('💳 No billing account found. Use /upgrade to subscribe to Pro.');
+      return;
+    }
+    
+    const tier = userData.subscription_tier || 'free';
+    const status = userData.subscription_status || 'active';
+    
+    let statusEmoji = '✅';
+    if (status === 'canceled') statusEmoji = '❌';
+    else if (status === 'past_due') statusEmoji = '⚠️';
+    
+    await ctx.reply(
+      `💳 **Billing Information**\n\n` +
+      `📋 **Plan:** ${tier.toUpperCase()}\n` +
+      `${statusEmoji} **Status:** ${status}\n\n` +
+      `[Manage Subscription](${process.env.BASE_URL || 'http://localhost:3000'}/portal?customer_id=${userData.stripe_customer_id})\n\n` +
+      `Need help? Contact support.`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    );
+    
+  } catch (error) {
+    console.error('Error in billing command:', error);
+    await ctx.reply('❌ Sorry, there was an error. Please try again.');
+  }
+});
+
+bot.command('usage', async (ctx) => {
+  try {
+    const userData = await getOrCreateUser(ctx.from);
+    
+    const { data: currentUsage } = await supabase.rpc('get_user_monthly_usage', {
+      user_telegram_id: ctx.from.id
+    });
+    
+    const tier = userData.subscription_tier || 'free';
+    const limit = tier === 'free' ? 20 : '∞';
+    
+    let usageBar = '';
+    if (tier === 'free') {
+      const percentage = Math.min((currentUsage / 20) * 10, 10);
+      usageBar = '█'.repeat(Math.floor(percentage)) + '░'.repeat(10 - Math.floor(percentage));
+    }
+    
+    await ctx.reply(
+      `📊 **Monthly Usage Report**\n\n` +
+      `📋 **Plan:** ${tier.toUpperCase()}\n` +
+      `📸 **Receipts:** ${currentUsage}/${limit}\n` +
+      (tier === 'free' ? `\n[${usageBar}]\n\n` : '\n') +
+      (tier === 'free' && currentUsage >= 15 ? `⚠️ **Almost at limit!** Consider [upgrading](${process.env.BASE_URL || 'http://localhost:3000'}/checkout?tier=pro&telegram_id=${ctx.from.id})\n` : '') +
+      `📅 **Month:** ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}`,
+      { parse_mode: 'Markdown', disable_web_page_preview: true }
+    );
+    
+  } catch (error) {
+    console.error('Error in usage command:', error);
+    await ctx.reply('❌ Sorry, there was an error checking usage.');
+  }
+});
+
 // Photo message handler
 bot.on('message:photo', async (ctx) => {
   try {
     console.log(`Received photo from ${ctx.from.first_name} (${ctx.from.id})`);
-    
-    // Send initial processing message
-    const processingMsg = await ctx.reply('📸 Processing your receipt with AI...');
     
     // Get user data
     const userData = await getOrCreateUser(ctx.from);
@@ -1435,6 +1537,37 @@ bot.on('message:photo', async (ctx) => {
       await ctx.reply('🧾 Welcome! Please use /start to set up your account first.');
       return;
     }
+    
+    // Check usage limits
+    const { data: canProcess } = await supabase.rpc('can_user_process_receipt', {
+      user_telegram_id: ctx.from.id
+    });
+    
+    if (!canProcess) {
+      const { data: currentUsage } = await supabase.rpc('get_user_monthly_usage', {
+        user_telegram_id: ctx.from.id
+      });
+      
+      const tier = userData.subscription_tier || 'free';
+      const limit = tier === 'free' ? 20 : 'unlimited';
+      
+      await ctx.reply(
+        `📊 **Monthly Limit Reached**\n\n` +
+        `You've processed **${currentUsage}/${limit}** receipts this month.\n\n` +
+        `🚀 **Upgrade to Pro** for unlimited receipts!\n` +
+        `• Unlimited photo processing\n` +
+        `• Job tagging\n` +
+        `• CSV exports\n` +
+        `• Monthly reports\n\n` +
+        `💰 Only **$4.99/month**\n\n` +
+        `[Upgrade Now](${process.env.BASE_URL || 'http://localhost:3000'}/checkout?tier=pro&telegram_id=${ctx.from.id})`,
+        { parse_mode: 'Markdown', disable_web_page_preview: true }
+      );
+      return;
+    }
+    
+    // Send initial processing message
+    const processingMsg = await ctx.reply('📸 Processing your receipt with AI...');
     
     // Check if there's a caption for job tagging
     const caption = ctx.message.caption?.trim();
@@ -1497,6 +1630,17 @@ bot.on('message:photo', async (ctx) => {
     if (receiptError) {
       console.error('Error saving receipt:', receiptError);
       throw receiptError;
+    }
+    
+    // Increment usage counter
+    try {
+      await supabase.rpc('increment_user_usage', {
+        user_telegram_id: ctx.from.id
+      });
+      console.log(`Incremented usage for user ${ctx.from.id}`);
+    } catch (usageError) {
+      console.error('Error incrementing usage:', usageError);
+      // Don't fail the whole operation for this
     }
     
     // Format and send results

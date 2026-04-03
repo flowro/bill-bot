@@ -4,8 +4,10 @@
   "description": "Telegram bot for receipt tracking and expense management for tradespeople",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
+    "start": "node server.js",
+    "bot": "node index.js",
+    "web": "node src/web/pricing-server.js",
+    "dev": "node --watch server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -21,11 +23,13 @@
     "@anthropic-ai/sdk": "^0.33.0",
     "@supabase/supabase-js": "^2.101.1",
     "dotenv": "^17.3.1",
+    "express": "^5.2.1",
     "grammy": "^1.35.3",
     "node-cron": "^3.0.3",
     "pdfkit": "^0.18.0",
     "puppeteer": "^24.40.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "stripe": "^22.0.0"
   },
   "engines": {
     "node": ">=18"
