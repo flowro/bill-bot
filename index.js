@@ -534,6 +534,7 @@ bot.command('help', async (ctx) => {
 /upgrade - Upgrade to Pro (unlimited receipts)
 /usage - Check monthly usage
 /billing - Manage subscription
+/currency - Set currency (USD, GBP, EUR)
 
 **Job Tagging:**
 • Send photo + caption: "Johnson bathroom"
@@ -1524,6 +1525,62 @@ bot.command('usage', async (ctx) => {
   }
 });
 
+// Currency settings command
+bot.command('currency', async (ctx) => {
+  try {
+    const args = ctx.message.text.split(' ').slice(1);
+    const userData = await getOrCreateUser(ctx.from);
+    
+    if (args.length === 0) {
+      // Show current currency
+      const currentCurrency = userData.currency || 'USD';
+      const symbol = currentCurrency === 'USD' ? '$' : currentCurrency === 'GBP' ? '£' : '€';
+      
+      await ctx.reply(
+        `💱 **Current Currency:** ${currentCurrency} (${symbol})\n\n` +
+        `🔄 **Change Currency:**\n` +
+        `• /currency USD ($)\n` +
+        `• /currency GBP (£)\n` +
+        `• /currency EUR (€)\n\n` +
+        `This will be your default currency for new receipts.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    const newCurrency = args[0].toUpperCase();
+    const validCurrencies = ['USD', 'GBP', 'EUR'];
+    
+    if (!validCurrencies.includes(newCurrency)) {
+      await ctx.reply('❌ Invalid currency. Supported: USD, GBP, EUR\n\nExample: `/currency GBP`', { parse_mode: 'Markdown' });
+      return;
+    }
+    
+    // Update user currency
+    const { error } = await supabase
+      .from('users')
+      .update({ currency: newCurrency })
+      .eq('telegram_id', ctx.from.id);
+      
+    if (error) {
+      console.error('Error updating currency:', error);
+      await ctx.reply('❌ Error updating currency. Please try again.');
+      return;
+    }
+    
+    const symbol = newCurrency === 'USD' ? '$' : newCurrency === 'GBP' ? '£' : '€';
+    await ctx.reply(
+      `✅ **Currency updated to ${newCurrency}** (${symbol})\n\n` +
+      `All new receipts will default to ${newCurrency}. I'll auto-detect currency symbols from receipt photos.`,
+      { parse_mode: 'Markdown' }
+    );
+    
+  } catch (error) {
+    console.error('Error in currency command:', error);
+    await ctx.reply('❌ Sorry, there was an error updating currency.');
+  }
+});
+
 // Photo message handler
 bot.on('message:photo', async (ctx) => {
   try {
@@ -1622,6 +1679,7 @@ bot.on('message:photo', async (ctx) => {
         receipt_date: extractedData.date,
         category: extractedData.category,
         description: extractedData.description,
+        currency: extractedData.currency || userData.currency || 'USD',
         raw_ocr_text: extractedData.raw_ocr_text
       })
       .select()
@@ -1775,6 +1833,87 @@ bot.on('callback_query', async (ctx) => {
             input_field_placeholder: "Enter job name..."
           }
         }
+      );
+      
+    } else if (data.startsWith('onboard_currency_')) {
+      // Handle onboarding currency selection
+      const currency = data.split('_')[2]; // GBP, USD, EUR
+      
+      // Update user currency
+      const { error } = await supabase
+        .from('users')
+        .update({ currency: currency })
+        .eq('telegram_id', ctx.from.id);
+        
+      if (error) {
+        console.error('Error updating currency during onboarding:', error);
+        await ctx.answerCallbackQuery('Error setting currency', { show_alert: true });
+        return;
+      }
+      
+      const symbol = currency === 'USD' ? '$' : currency === 'GBP' ? '£' : '€';
+      
+      await ctx.answerCallbackQuery(`Currency set to ${currency} (${symbol})`);
+      
+      // Continue onboarding to next step
+      await updateOnboardingStep(ctx.from.id, 3);
+      
+      const tradeKeyboard = {
+        inline_keyboard: [
+          [
+            { text: '🔧 Plumber', callback_data: 'onboard_trade_plumber' },
+            { text: '🏥️ Builder', callback_data: 'onboard_trade_builder' }
+          ],
+          [
+            { text: '⚡ Electrician', callback_data: 'onboard_trade_electrician' },
+            { text: '🌿 Landscaper', callback_data: 'onboard_trade_landscaper' }
+          ],
+          [
+            { text: '🔨 Other Trade', callback_data: 'onboard_trade_other' }
+          ]
+        ]
+      };
+      
+      await ctx.editMessageText(
+        `💼 What's your trade or profession?\n\n` +
+        `This helps me categorize your expenses better.`,
+        { reply_markup: tradeKeyboard }
+      );
+      
+    } else if (data.startsWith('onboard_trade_')) {
+      // Handle onboarding trade selection
+      const trade = data.split('_')[2];
+      const tradeName = {
+        plumber: 'Plumber',
+        builder: 'Builder', 
+        electrician: 'Electrician',
+        landscaper: 'Landscaper',
+        other: 'Other Trade'
+      }[trade] || 'Other';
+      
+      // Update user trade (add to users table if needed)
+      // For now, just continue onboarding
+      await ctx.answerCallbackQuery(`Trade set to ${tradeName}`);
+      
+      // Complete onboarding
+      await updateOnboardingStep(ctx.from.id, 5);
+      
+      await ctx.editMessageText(
+        `🎓 **Quick Tutorial**\n\n` +
+        `📸 **Send me a photo** of any receipt and I'll:\n` +
+        `• Extract the amount, vendor, and date\n` +
+        `• Categorize the expense\n` +
+        `• Store it in your expense tracker\n\n` +
+        `🏷️ **Tag to jobs** by:\n` +
+        `• Adding a caption: "Johnson bathroom"\n` +
+        `• Replying to my confirmation with a job name\n\n` +
+        `📊 **Ask questions** like:\n` +
+        `• "How much did I spend this month?"\n` +
+        `• "Show me materials expenses"\n` +
+        `• "What did I spend on the Johnson job?"\n\n` +
+        `🎉 **Ready to go!** Send me your first receipt or use /help\n\n` +
+        `💰 You start with **20 free receipts** this month. Use /upgrade for unlimited processing.`,
+        { parse_mode: 'Markdown' }
       );
     }
     

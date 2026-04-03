@@ -19,6 +19,7 @@ Extract these fields and return as valid JSON only (no other text):
   "date": "YYYY-MM-DD (receipt date, estimate if unclear)",
   "category": "string (one of: materials, fuel, tools, food, labor, vehicle, office, other)",
   "description": "string (brief description of items/services)",
+  "currency": "string (USD, GBP, or EUR - detect from currency symbols £, €, $ or context)",
   "confidence": number (0-1, how confident you are in the extraction)
 }
 
@@ -98,6 +99,7 @@ async function processReceipt(imagePath) {
       vendor: extractedData.vendor || 'Unknown',
       date: extractedData.date || new Date().toISOString().split('T')[0],
       category: extractedData.category || 'other',
+      currency: extractedData.currency || 'USD',
       description: extractedData.description || 'Receipt processed',
       confidence: extractedData.confidence || 0.5,
       raw_ocr_text: responseText // Store full response for debugging
@@ -136,7 +138,10 @@ function formatReceiptData(data) {
   let message = `🧾 **Receipt Processed** ${confidenceEmoji}\n\n`;
   
   if (data.amount) {
-    message += `💰 **Amount:** £${data.amount.toFixed(2)}\n`;
+    const currency = data.currency || 'USD';
+    const symbol = currency === 'USD' ? '$' : currency === 'GBP' ? '£' : '€';
+    const formattedAmount = currency === 'EUR' ? `${data.amount.toFixed(2)}${symbol}` : `${symbol}${data.amount.toFixed(2)}`;
+    message += `💰 **Amount:** ${formattedAmount} (${currency})\n`;
   } else {
     message += `💰 **Amount:** Not detected\n`;
   }
